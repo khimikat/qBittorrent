@@ -98,7 +98,7 @@ jobs:
           $folder = "boost_${{ matrix.libtorrent.boost_major_version }}_${{ matrix.libtorrent.boost_minor_version }}_${{ matrix.libtorrent.boost_patch_version }}"
           $url = "https://archives.boost.io/release/$ver/source/$folder.tar.gz"
           $url2 = "https://sourceforge.net/projects/boost/files/boost/$ver/$folder.tar.gz"
-          
+
           try {
             Invoke-WebRequest -Uri $url -OutFile "${{ runner.temp }}/boost.tar.gz"
             tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
@@ -107,13 +107,15 @@ jobs:
             tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
           }
           Move-Item "${{ github.workspace }}/../$folder" "${{ env.boost_path }}"
-          
+
+          # Критично: запускаем b2 из каталога Boost
+          Push-Location ${{ env.boost_path }}
           & "${{ env.vcpkg_path }}/installed/${{ matrix.config.arch }}-windows-static-md-release/tools/boost-build/b2.exe" `
             -d0 `
             toolset=msvc `
-            --prefix="${{ env.boost_path }}" `
-            --with-headers `
-            install
+            --stagedir=. `
+            --with-headers
+          Pop-Location
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
