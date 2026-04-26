@@ -1,20 +1,21 @@
-name: CI - Windows
+name: Release - Windows
 
-on: [pull_request, push]
+on:
+  release:
+    types: [published]
+  workflow_dispatch:  # возможность запустить вручную
 
-permissions: {}
+permissions:
+  contents: write    # для загрузки ассетов в релиз
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: ${{ github.head_ref != '' }}
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
-  ci:
-    name: Build (${{ matrix.libtorrent.version }}, ${{ matrix.config.arch }})
-    runs-on: ${{ matrix.config.os }}
-    permissions:
-      actions: write
-
+  build-windows:
+    name: Windows (${{ matrix.libtorrent.version }}, ${{ matrix.config.arch }})
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
@@ -32,18 +33,19 @@ jobs:
             boost_minor_version: "86"
             boost_patch_version: "0"
         config:
-        - os: windows-latest
-          arch: x64
-          qt_arch: win64_msvc2022_64
+          - os: windows-latest
+            arch: x64
+            qt_arch: win64_msvc2022_64
 
     env:
       boost_path: "${{ github.workspace }}/../boost"
       libtorrent_path: "${{ github.workspace }}/../libtorrent"
       vcpkg_path: "c:/vcpkg"
+      QT_ROOT_DIR: ""  # будет установлен действием install-qt
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
@@ -54,68 +56,64 @@ jobs:
 
       - name: Install build tools
         run: |
-          if ((Get-Command "ninja.exe" -ErrorAction SilentlyContinue) -eq $null)
-          {
-            choco install ninja
+          if (-not (Get-Command "ninja.exe" -ErrorAction SilentlyContinue)) {
+            choco install ninja --no-progress
           }
-          where.exe ninja
           ninja --version
 
-      # https://learn.microsoft.com/en-us/vcpkg/users/binarycaching#gha
-      - name: Set variables for vcpkg
-        uses: actions/github-script@v8
+      - name: Set variables for vcpkg (binary caching)
+        uses: actions/github-script@v7
         with:
           script: |
-            core.exportVariable('ACTIONS_CACHE_URL', (process.env.ACTIONS_CACHE_URL || ''));
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', (process.env.ACTIONS_RUNTIME_TOKEN || ''));
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Install dependencies with vcpkg
         run: |
-          # create our own triplet
-          New-Item `
-            -Force `
-            -ItemType File `
-            -Path "${{ env.vcpkg_path }}/triplets_overlay/${{ matrix.config.arch }}-windows-static-md-release.cmake"
-          # OpenSSL isn't compatible with `/guard:cf` flag so we omit it for now, see: https://github.com/openssl/openssl/issues/22554
-          Add-Content `
-            -Path "${{ env.vcpkg_path }}/triplets_overlay/${{ matrix.config.arch }}-windows-static-md-release.cmake" `
-            -Value @("set(VCPKG_TARGET_ARCHITECTURE ${{ matrix.config.arch }})",
-              "set(VCPKG_LIBRARY_LINKAGE static)",
-              "set(VCPKG_CRT_LINKAGE dynamic)",
-              "set(VCPKG_BUILD_TYPE release)")
-          # clear buildtrees after each package installation to reduce disk space requirements
-          $packages = `
-            "boost-build:${{ matrix.config.arch }}-windows-static-md-release",
-            "openssl:${{ matrix.config.arch }}-windows-static-md-release",
-            "zlib:${{ matrix.config.arch }}-windows-static-md-release"
-          ${{ env.vcpkg_path }}/vcpkg.exe upgrade `
-            --no-dry-run `
-            --overlay-triplets="${{ env.vcpkg_path }}/triplets_overlay"
-          ${{ env.vcpkg_path }}/vcpkg.exe install `
+          $triplet = "${{ matrix.config.arch }}-windows-static-md-release"
+          $tripletDir  = "${{ env.vcpkg_path }}/triplets_overlay"
+          New-Item -Force -ItemType Directory -Path $tripletDir
+          Set-Content -Path "$tripletDir/$triplet.cmake" -Value @"
+          set(VCPKG_TARGET_ARCHITECTURE ${{ matrix.config.arch }})
+          set(VCPKG_LIBRARY_LINKAGE static)
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_BUILD_TYPE release)
+          "@
+          
+          $packages = @(
+            "boost-build:$triplet",
+            "openssl:$triplet",
+            "zlib:$triplet"
+          )
+          & "${{ env.vcpkg_path }}/vcpkg.exe" upgrade --no-dry-run --overlay-triplets="$tripletDir"
+          & "${{ env.vcpkg_path }}/vcpkg.exe" install `
             --binarysource="clear;x-gha,readwrite" `
             --clean-after-build `
-            --overlay-triplets="${{ env.vcpkg_path }}/triplets_overlay" `
+            --overlay-triplets="$tripletDir" `
             $packages
 
-      - name: Install boost
+      - name: Install Boost
         run: |
-          $boost_url="https://archives.boost.io/release/${{ matrix.libtorrent.boost_major_version }}.${{ matrix.libtorrent.boost_minor_version }}.${{ matrix.libtorrent.boost_patch_version }}/source/boost_${{ matrix.libtorrent.boost_major_version }}_${{ matrix.libtorrent.boost_minor_version }}_${{ matrix.libtorrent.boost_patch_version }}.tar.gz"
-          $boost_url2="https://sourceforge.net/projects/boost/files/boost/${{ matrix.libtorrent.boost_major_version }}.${{ matrix.libtorrent.boost_minor_version }}.${{ matrix.libtorrent.boost_patch_version }}/boost_${{ matrix.libtorrent.boost_major_version }}_${{ matrix.libtorrent.boost_minor_version }}_${{ matrix.libtorrent.boost_patch_version }}.tar.gz"
-          curl -L -o "${{ runner.temp }}/boost.tar.gz" "$boost_url"
-          tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
-          if ($LastExitCode -ne 0)
-          {
-            curl -L -o "${{ runner.temp }}/boost.tar.gz" "$boost_url2"
+          $ver = "${{ matrix.libtorrent.boost_major_version }}.${{ matrix.libtorrent.boost_minor_version }}.${{ matrix.libtorrent.boost_patch_version }}"
+          $folder = "boost_${{ matrix.libtorrent.boost_major_version }}_${{ matrix.libtorrent.boost_minor_version }}_${{ matrix.libtorrent.boost_patch_version }}"
+          $url = "https://archives.boost.io/release/$ver/source/$folder.tar.gz"
+          $url2 = "https://sourceforge.net/projects/boost/files/boost/$ver/$folder.tar.gz"
+          
+          try {
+            Invoke-WebRequest -Uri $url -OutFile "${{ runner.temp }}/boost.tar.gz"
+            tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
+          } catch {
+            Invoke-WebRequest -Uri $url2 -OutFile "${{ runner.temp }}/boost.tar.gz"
             tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
           }
-          move "${{ github.workspace }}/../boost_*" "${{ env.boost_path }}"
-          cd "${{ env.boost_path }}"
-          #.\bootstrap.bat
-          ${{ env.vcpkg_path }}/installed/${{ matrix.config.arch }}-windows-static-md-release/tools/boost-build/b2.exe `
-            stage `
+          Move-Item "${{ github.workspace }}/../$folder" "${{ env.boost_path }}"
+          
+          & "${{ env.vcpkg_path }}/installed/${{ matrix.config.arch }}-windows-static-md-release/tools/boost-build/b2.exe" `
+            -d0 `
             toolset=msvc `
-            --stagedir=.\ `
-            --with-headers
+            --prefix="${{ env.boost_path }}" `
+            --with-headers `
+            install
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -126,7 +124,7 @@ jobs:
           modules: qtimageformats
           cache: true
 
-      - name: Install libtorrent
+      - name: Build libtorrent
         run: |
           git clone `
             --branch v${{ matrix.libtorrent.version }} `
@@ -134,112 +132,103 @@ jobs:
             --recurse-submodules `
             https://github.com/arvidn/libtorrent.git `
             ${{ env.libtorrent_path }}
-          cd ${{ env.libtorrent_path }}
-          $env:CXXFLAGS+=" /guard:cf"
-          $env:LDFLAGS+=" /GUARD:CF"
+          
+          $env:CXXFLAGS += " /guard:cf"
+          $env:LDFLAGS  += " /GUARD:CF"
           cmake `
-            -B build `
-            -G "Ninja" `
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -S ${{ env.libtorrent_path }} `
+            -B ${{ env.libtorrent_path }}/build `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_CXX_STANDARD=20 `
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DCMAKE_INSTALL_PREFIX="${{ env.libtorrent_path }}/install" `
             -DCMAKE_TOOLCHAIN_FILE="${{ env.vcpkg_path }}/scripts/buildsystems/vcpkg.cmake" `
-            -DBOOST_ROOT="${{ env.boost_path }}/lib/cmake" `
+            -DBOOST_ROOT="${{ env.boost_path }}" `
             -DBUILD_SHARED_LIBS=OFF `
             -Ddeprecated-functions=OFF `
             -Dstatic_runtime=OFF `
             -DVCPKG_TARGET_TRIPLET=${{ matrix.config.arch }}-windows-static-md-release
-          cmake --build build
-          cmake --install build
+          cmake --build ${{ env.libtorrent_path }}/build --config Release
+          cmake --install ${{ env.libtorrent_path }}/build --config Release
 
       - name: Build qBittorrent
         run: |
-          $env:CXXFLAGS+="/DQT_FORCE_ASSERTS /WX"
+          $env:CXXFLAGS += " /DQT_FORCE_ASSERTS /WX"
           cmake `
+            -S . `
             -B build `
-            -G "Ninja" `
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="${{ env.vcpkg_path }}/scripts/buildsystems/vcpkg.cmake" `
-            -DBOOST_ROOT="${{ env.boost_path }}/lib/cmake" `
+            -DBOOST_ROOT="${{ env.boost_path }}" `
             -DLibtorrentRasterbar_DIR="${{ env.libtorrent_path }}/install/lib/cmake/LibtorrentRasterbar" `
             -DMSVC_RUNTIME_DYNAMIC=ON `
-            -DTESTING=ON `
             -DVCPKG_TARGET_TRIPLET=${{ matrix.config.arch }}-windows-static-md-release `
-            -DVERBOSE_CONFIGURE=ON `
-            --graphviz=build/target_graph.dot
-          cmake --build build --target qbt_update_translations
-          cmake --build build
-          cmake --build build --target check
+            -DVERBOSE_CONFIGURE=ON
+          cmake --build build --config Release --target qbt_update_translations
+          cmake --build build --config Release
 
-      - name: Prepare build artifacts
+      - name: Prepare portable package
         run: |
-          mkdir upload
-          mkdir upload/qBittorrent
-          # binaries
-          copy build/qbittorrent.exe upload/qBittorrent
-          copy build/qbittorrent.pdb upload/qBittorrent
-          copy dist/windows/qt.conf upload/qBittorrent
-          # runtimes
-          copy "${{ env.Qt_ROOT_DIR }}/bin/Qt6Core.dll" upload/qBittorrent
-          copy "${{ env.Qt_ROOT_DIR }}/bin/Qt6Gui.dll" upload/qBittorrent
-          copy "${{ env.Qt_ROOT_DIR }}/bin/Qt6Network.dll" upload/qBittorrent
-          copy "${{ env.Qt_ROOT_DIR }}/bin/Qt6Sql.dll" upload/qBittorrent
-          copy "${{ env.Qt_ROOT_DIR }}/bin/Qt6Svg.dll" upload/qBittorrent
-          copy "${{ env.Qt_ROOT_DIR }}/bin/Qt6Widgets.dll" upload/qBittorrent
-          copy "${{ env.Qt_ROOT_DIR }}/bin/Qt6Xml.dll" upload/qBittorrent
-          mkdir upload/qBittorrent/plugins/iconengines
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/iconengines/qsvgicon.dll" upload/qBittorrent/plugins/iconengines
-          mkdir upload/qBittorrent/plugins/imageformats
-          # include all imageformats dlls since CI (dev) build links dynamically
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qgif.dll" upload/qBittorrent/plugins/imageformats
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qicns.dll" upload/qBittorrent/plugins/imageformats
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qico.dll" upload/qBittorrent/plugins/imageformats
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qjpeg.dll" upload/qBittorrent/plugins/imageformats
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qsvg.dll" upload/qBittorrent/plugins/imageformats
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qtga.dll" upload/qBittorrent/plugins/imageformats
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qtiff.dll" upload/qBittorrent/plugins/imageformats
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qwbmp.dll" upload/qBittorrent/plugins/imageformats
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/imageformats/qwebp.dll" upload/qBittorrent/plugins/imageformats
-          mkdir upload/qBittorrent/plugins/platforms
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/platforms/qwindows.dll" upload/qBittorrent/plugins/platforms
-          mkdir upload/qBittorrent/plugins/sqldrivers
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/sqldrivers/qsqlite.dll" upload/qBittorrent/plugins/sqldrivers
-          mkdir upload/qBittorrent/plugins/styles
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/styles/qmodernwindowsstyle.dll" upload/qBittorrent/plugins/styles
-          mkdir upload/qBittorrent/plugins/tls
-          copy "${{ env.Qt_ROOT_DIR }}/plugins/tls/qschannelbackend.dll" upload/qBittorrent/plugins/tls
-          # cmake additionals
-          mkdir upload/cmake
-          copy build/compile_commands.json upload/cmake
-          copy build/target_graph.dot upload/cmake
-          mkdir upload/cmake/libtorrent
-          copy ${{ env.libtorrent_path }}/build/compile_commands.json upload/cmake/libtorrent
+          $portableDir = "upload/qBittorrent_portable"
+          New-Item -ItemType Directory -Force -Path $portableDir
+          Copy-Item build/qbittorrent.exe $portableDir
+          Copy-Item dist/windows/qt.conf $portableDir
+          
+          # Qt runtime libraries
+          $qtBin = "${{ env.QT_ROOT_DIR }}/bin"
+          @("Qt6Core.dll","Qt6Gui.dll","Qt6Network.dll","Qt6Sql.dll",
+            "Qt6Svg.dll","Qt6Widgets.dll","Qt6Xml.dll") | % {
+              Copy-Item "$qtBin/$_" $portableDir
+          }
+          
+          # Plugins
+          $plugins = @{
+            "plugins/iconengines"   = @("qsvgicon.dll")
+            "plugins/imageformats"  = @("qgif.dll","qicns.dll","qico.dll","qjpeg.dll",
+                                        "qsvg.dll","qtga.dll","qtiff.dll","qwbmp.dll","qwebp.dll")
+            "plugins/platforms"     = @("qwindows.dll")
+            "plugins/sqldrivers"    = @("qsqlite.dll")
+            "plugins/styles"        = @("qmodernwindowsstyle.dll")
+            "plugins/tls"           = @("qschannelbackend.dll")
+          }
+          foreach ($dir in $plugins.Keys) {
+            $targetDir = "$portableDir/$dir"
+            New-Item -ItemType Directory -Force -Path $targetDir
+            foreach ($dll in $plugins[$dir]) {
+              Copy-Item "$qtBin/../$dir/$dll" $targetDir
+            }
+          }
+          
+          # Создаём zip-архив
+          $zipName = "qBittorrent_Windows_${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}_portable.zip"
+          Compress-Archive -Path "$portableDir/*" -DestinationPath $zipName
+          echo "zipName=$zipName" >> $env:GITHUB_ENV
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: qBittorrent-CI_Windows-${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}
-          path: upload
-
-      - name: Install NSIS
-        uses: repolevedavaj/install-nsis@a55ed92772254d1e51d880f85ce9b5719f907801 # v1.1.0
-        with:
-          nsis-version: '3.11'
-
-      - name: Create installer
+      - name: Install NSIS and create installer
         run: |
-          7z x -o"dist/windows/" "dist/windows/NSISPlugins.zip"
-          makensis `
+          # Установка NSIS вручную через chocolatey
+          choco install nsis --version=3.11 --no-progress -y
+          $env:Path += ";C:\Program Files (x86)\NSIS"
+          
+          # Распаковка плагинов NSIS
+          Expand-Archive -Force -Path "dist/windows/NSISPlugins.zip" -DestinationPath "dist/windows/"
+          
+          $installerName = "qBittorrent_Windows_${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}_setup.exe"
+          & makensis `
             /DQBT_CPU_ARCH="${{ matrix.config.arch }}" `
-            /DQBT_DIST_DIR="../../upload/qBittorrent" `
+            /DQBT_DIST_DIR="../../upload/qBittorrent_portable" `
             /WX `
             dist/windows/qbittorrent.nsi
-          move "dist/windows/qbittorrent_*_setup.exe" "qBittorrent-CI_Windows-${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}-setup.exe"
+          
+          Move-Item "dist/windows/qbittorrent_*_setup.exe" $installerName
+          echo "installerName=$installerName" >> $env:GITHUB_ENV
 
-      - name: Upload installer
-        uses: actions/upload-artifact@v7
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v2
         with:
-          archive: false
-          path: qBittorrent-CI_Windows-${{ matrix.config.arch }}_libtorrent-${{ matrix.libtorrent.version }}-setup.exe
+          files: |
+            ${{ env.zipName }}
+            ${{ env.installerName }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
